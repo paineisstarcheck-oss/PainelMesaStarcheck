@@ -17,7 +17,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 # ------------------ CONFIG BÁSICA ------------------
 st.set_page_config(page_title="Painel Mesa de Análise — STARCHECK", layout="wide")
-st.title("🧮 Painel Mesa de Análise — TOKYO")
+st.title("🧮 Painel Mesa de Análise — STARCHECK")
 
 # Cor padrão dos gráficos
 CHART_COLOR = "#730000"
