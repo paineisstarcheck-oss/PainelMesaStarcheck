@@ -20,7 +20,7 @@ st.set_page_config(page_title="Painel Mesa de Análise — STARCHECK", layout="w
 st.title("🧮 Painel Mesa de Análise — STARCHECK")
 
 # Cor padrão dos gráficos
-CHART_COLOR = "#258eef"
+CHART_COLOR = "#1994e1"
 
 st.markdown(
     """
