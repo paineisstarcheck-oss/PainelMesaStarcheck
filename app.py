@@ -456,19 +456,46 @@ with col2:
     with c22:
         f_vists = st.multiselect("Vistoriadores (opcional)", vist_opts)
 
-if f_analistas:
-    ups = [_upper(a) for a in f_analistas]
-    mask_keep = (viewProd["TIPO_USUARIO"] != "ANALISTA MESA") | (viewProd["USUARIO"].isin(ups))
-    viewProd = viewProd[mask_keep]
-    if not viewCrit.empty and "ANALISTA" in viewCrit.columns:
-        viewCrit = viewCrit[viewCrit["ANALISTA"].isin(ups)]
+# --- NOVO: filtros por OS (faz o painel inteiro respeitar o filtro) ---
+os_keep = None  # vira set() quando algum filtro estiver ativo
 
+# filtro por analista: pega as OS onde aquele analista aparece em "ANALISTA MESA"
+if f_analistas:
+    ups_a = [_upper(a) for a in f_analistas]
+    os_a = (
+        viewProd[
+            (viewProd["TIPO_USUARIO"] == "ANALISTA MESA") &
+            (viewProd["USUARIO"].isin(ups_a))
+        ]["OS"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    os_keep = set(os_a)
+
+# filtro por vistoriador: pega as OS onde aquele vistoriador aparece em "VISTORIADOR"
 if f_vists:
-    ups = [_upper(v) for v in f_vists]
-    mask_keep = (viewProd["TIPO_USUARIO"] != "VISTORIADOR") | (viewProd["USUARIO"].isin(ups))
-    viewProd = viewProd[mask_keep]
-    if not viewCrit.empty and "VISTORIADOR" in viewCrit.columns:
-        viewCrit = viewCrit[viewCrit["VISTORIADOR"].isin(ups)]
+    ups_v = [_upper(v) for v in f_vists]
+    os_v = (
+        viewProd[
+            (viewProd["TIPO_USUARIO"] == "VISTORIADOR") &
+            (viewProd["USUARIO"].isin(ups_v))
+        ]["OS"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    os_v = set(os_v)
+    os_keep = (os_keep & os_v) if os_keep is not None else os_v
+
+# aplica o recorte por OS em tudo (produção e crítica)
+if os_keep is not None:
+    viewProd = viewProd[viewProd["OS"].astype(str).isin(os_keep)].copy()
+
+    if not viewCrit.empty and "OS" in viewCrit.columns:
+        viewCrit = viewCrit[viewCrit["OS"].astype(str).isin(os_keep)].copy()
 
 if viewProd.empty:
     st.info("Sem registros de produção da mesa de análise no período/filtros.")
@@ -706,6 +733,10 @@ with q1:
         st.info("Sem registros na base de CRÍTICA para o recorte atual.")
     else:
         base_crit = base_crit.dropna(subset=["OS"]).copy()
+                # garante que o índice respeite o filtro por OS (mesmo com fallback)
+        if "os_keep" in locals() and os_keep is not None:
+            base_crit = base_crit[base_crit["OS"].astype(str).isin(os_keep)].copy()
+
         base_crit["STATUS_CRITICA"] = base_crit["STATUS_CRITICA"].astype(str).str.upper().str.strip()
 
         if "DATA_CRITICA" in base_crit.columns:
