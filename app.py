@@ -506,7 +506,13 @@ base_analista = viewProd[viewProd["TIPO_USUARIO"] == "ANALISTA MESA"].copy()
 base_fila = viewProd[viewProd["TIPO_USUARIO"] == "FILA MESA"].copy()
 base_vist = viewProd[viewProd["TIPO_USUARIO"] == "VISTORIADOR"].copy()
 
+# OS únicas analisadas (recomendado para "vistorias analisadas")
+base_analista_os = base_analista.dropna(subset=["OS"]).copy()
+total_vistorias_analista = int(base_analista_os["OS"].nunique())
+
+# (opcional) manter também o total de registros (linhas)
 total_registros_analista = int(len(base_analista))
+
 analistas_avaliados = int(base_analista["USUARIO"].nunique()) if not base_analista.empty else 0
 
 tempo_medio_analista = base_analista["TEMPO_SEG"].mean() if not base_analista.empty else np.nan
@@ -519,8 +525,8 @@ tempo_medio_total_proc = tempo_total_por_os.mean() if len(tempo_total_por_os) el
 cards_html = f"""
 <div class="card-wrap">
   <div class='card'>
-    <h4>Registros de análise (Analista Mesa)</h4>
-    <h2>{total_registros_analista:,}</h2>
+    <h4>Vistorias analisadas (OS únicas)</h4>
+    <h2>{total_vistorias_analista:,}</h2>
   </div>
   <div class='card'>
     <h4>Analistas avaliados</h4>
