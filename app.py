@@ -456,46 +456,19 @@ with col2:
     with c22:
         f_vists = st.multiselect("Vistoriadores (opcional)", vist_opts)
 
-# --- NOVO: filtros por OS (faz o painel inteiro respeitar o filtro) ---
-os_keep = None  # vira set() quando algum filtro estiver ativo
-
-# filtro por analista: pega as OS onde aquele analista aparece em "ANALISTA MESA"
 if f_analistas:
-    ups_a = [_upper(a) for a in f_analistas]
-    os_a = (
-        viewProd[
-            (viewProd["TIPO_USUARIO"] == "ANALISTA MESA") &
-            (viewProd["USUARIO"].isin(ups_a))
-        ]["OS"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    os_keep = set(os_a)
+    ups = [_upper(a) for a in f_analistas]
+    mask_keep = (viewProd["TIPO_USUARIO"] != "ANALISTA MESA") | (viewProd["USUARIO"].isin(ups))
+    viewProd = viewProd[mask_keep]
+    if not viewCrit.empty and "ANALISTA" in viewCrit.columns:
+        viewCrit = viewCrit[viewCrit["ANALISTA"].isin(ups)]
 
-# filtro por vistoriador: pega as OS onde aquele vistoriador aparece em "VISTORIADOR"
 if f_vists:
-    ups_v = [_upper(v) for v in f_vists]
-    os_v = (
-        viewProd[
-            (viewProd["TIPO_USUARIO"] == "VISTORIADOR") &
-            (viewProd["USUARIO"].isin(ups_v))
-        ]["OS"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-    os_v = set(os_v)
-    os_keep = (os_keep & os_v) if os_keep is not None else os_v
-
-# aplica o recorte por OS em tudo (produção e crítica)
-if os_keep is not None:
-    viewProd = viewProd[viewProd["OS"].astype(str).isin(os_keep)].copy()
-
-    if not viewCrit.empty and "OS" in viewCrit.columns:
-        viewCrit = viewCrit[viewCrit["OS"].astype(str).isin(os_keep)].copy()
+    ups = [_upper(v) for v in f_vists]
+    mask_keep = (viewProd["TIPO_USUARIO"] != "VISTORIADOR") | (viewProd["USUARIO"].isin(ups))
+    viewProd = viewProd[mask_keep]
+    if not viewCrit.empty and "VISTORIADOR" in viewCrit.columns:
+        viewCrit = viewCrit[viewCrit["VISTORIADOR"].isin(ups)]
 
 if viewProd.empty:
     st.info("Sem registros de produção da mesa de análise no período/filtros.")
@@ -506,13 +479,7 @@ base_analista = viewProd[viewProd["TIPO_USUARIO"] == "ANALISTA MESA"].copy()
 base_fila = viewProd[viewProd["TIPO_USUARIO"] == "FILA MESA"].copy()
 base_vist = viewProd[viewProd["TIPO_USUARIO"] == "VISTORIADOR"].copy()
 
-# OS únicas analisadas (recomendado para "vistorias analisadas")
-base_analista_os = base_analista.dropna(subset=["OS"]).copy()
-total_vistorias_analista = int(base_analista_os["OS"].nunique())
-
-# (opcional) manter também o total de registros (linhas)
 total_registros_analista = int(len(base_analista))
-
 analistas_avaliados = int(base_analista["USUARIO"].nunique()) if not base_analista.empty else 0
 
 tempo_medio_analista = base_analista["TEMPO_SEG"].mean() if not base_analista.empty else np.nan
@@ -525,8 +492,8 @@ tempo_medio_total_proc = tempo_total_por_os.mean() if len(tempo_total_por_os) el
 cards_html = f"""
 <div class="card-wrap">
   <div class='card'>
-    <h4>Vistorias analisadas (OS únicas)</h4>
-    <h2>{total_vistorias_analista:,}</h2>
+    <h4>Registros de análise (Analista Mesa)</h4>
+    <h2>{total_registros_analista:,}</h2>
   </div>
   <div class='card'>
     <h4>Analistas avaliados</h4>
@@ -739,10 +706,6 @@ with q1:
         st.info("Sem registros na base de CRÍTICA para o recorte atual.")
     else:
         base_crit = base_crit.dropna(subset=["OS"]).copy()
-                # garante que o índice respeite o filtro por OS (mesmo com fallback)
-        if "os_keep" in locals() and os_keep is not None:
-            base_crit = base_crit[base_crit["OS"].astype(str).isin(os_keep)].copy()
-
         base_crit["STATUS_CRITICA"] = base_crit["STATUS_CRITICA"].astype(str).str.upper().str.strip()
 
         if "DATA_CRITICA" in base_crit.columns:
