@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Painel Mesa de Análise — STARCHECK (multi-meses)
+# Ajustes principais:
+# 1) Leituras do Google Sheets mais robustas (evita falhas do get_all_records)
+# 2) Filtros por Analista/Vistoriador passam a filtrar por OS (painel inteiro respeita)
+# 3) Contagens/participações por analista feitas por OS únicas (evita "não bate")
 # ============================================================
 
-import os, json, re, unicodedata
+import os, json, re, unicodedata, time, random
 from datetime import datetime, date
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import streamlit as st
 import pandas as pd
@@ -13,6 +17,7 @@ import numpy as np
 import altair as alt
 
 import gspread
+from gspread.exceptions import APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
 # ------------------ CONFIG BÁSICA ------------------
@@ -51,7 +56,7 @@ ID_RE = re.compile(r"/d/([a-zA-Z0-9-_]+)")
 def _sheet_id(s: str) -> Optional[str]:
     if not s:
         return None
-    s = s.strip()
+    s = str(s).strip()
     m = ID_RE.search(s)
     if m:
         return m.group(1)
@@ -186,6 +191,54 @@ def looks_like_plate(s: str) -> bool:
     t = re.sub(r"[^A-Z0-9]", "", t)
     return bool(re.fullmatch(r"[A-Z]{3}\d[A-Z]\d{2}", t) or re.fullmatch(r"[A-Z]{3}\d{4}", t))
 
+# ------------------ LEITURA ROBUSTA (EVITA get_all_records) ------------------
+def _dedup_headers(headers: List[str]) -> List[str]:
+    """Garante cabeçalhos não-vazios e únicos (get_all_records costuma quebrar com cabeçalho ruim)."""
+    out = []
+    seen = {}
+    for i, h in enumerate(headers):
+        h2 = str(h).strip()
+        if not h2:
+            h2 = f"COL_{i+1}"
+        base = h2
+        k = seen.get(base, 0) + 1
+        seen[base] = k
+        if k > 1:
+            h2 = f"{base}_{k}"
+        out.append(h2)
+    return out
+
+def _ws_get_all_values_with_retry(ws, tries: int = 5, base_sleep: float = 0.8):
+    last_err = None
+    for n in range(tries):
+        try:
+            return ws.get_all_values()
+        except APIError as e:
+            last_err = e
+            time.sleep(base_sleep * (2 ** n) + random.random() * 0.35)
+        except Exception as e:
+            last_err = e
+            time.sleep(base_sleep * (2 ** n) + random.random() * 0.35)
+    raise last_err
+
+def ws_to_df(ws) -> pd.DataFrame:
+    """Converte uma worksheet em DataFrame usando get_all_values (mais resiliente)."""
+    values = _ws_get_all_values_with_retry(ws)
+    if not values or len(values) < 1:
+        return pd.DataFrame()
+
+    headers = _dedup_headers(values[0])
+    rows = values[1:] if len(values) > 1 else []
+    df = pd.DataFrame(rows, columns=headers)
+
+    # remove linhas completamente vazias
+    df = df.replace("", np.nan)
+    df = df.dropna(how="all")
+    df = df.fillna("")
+
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
 # ------------------ CONEXÃO COM GOOGLE ------------------
 def _get_client():
     try:
@@ -232,10 +285,11 @@ def read_index(sheet_id: str, tab: str) -> pd.DataFrame:
         ws = sh.worksheet(tab)
     except Exception as e:
         raise RuntimeError(f"O índice não possui aba '{tab}'.") from e
-    rows = ws.get_all_records()
-    if not rows:
+
+    df = ws_to_df(ws)
+    if df.empty:
         return pd.DataFrame(columns=["URL", "MÊS", "ATIVO"])
-    df = pd.DataFrame(rows)
+
     df.columns = [c.strip().upper() for c in df.columns]
     for need in ["URL", "MÊS", "ATIVO"]:
         if need not in df.columns:
@@ -248,12 +302,10 @@ def read_producao_month(sheet_id: str) -> Tuple[pd.DataFrame, str]:
     sh = client.open_by_key(sheet_id)
     title = sh.title or sheet_id
     ws = sh.sheet1
-    rows = ws.get_all_records()
-    if not rows:
-        return pd.DataFrame(), title
 
-    df = pd.DataFrame(rows)
-    df.columns = [str(c).strip() for c in df.columns]
+    df = ws_to_df(ws)
+    if df.empty:
+        return pd.DataFrame(), title
 
     rename = {}
     for c in df.columns:
@@ -306,12 +358,10 @@ def read_critica_month(sheet_id: str) -> Tuple[pd.DataFrame, str]:
     sh = client.open_by_key(sheet_id)
     title = sh.title or sheet_id
     ws = sh.sheet1
-    rows = ws.get_all_records()
-    if not rows:
-        return pd.DataFrame(), title
 
-    df = pd.DataFrame(rows)
-    df.columns = [str(c).strip() for c in df.columns]
+    df = ws_to_df(ws)
+    if df.empty:
+        return pd.DataFrame(), title
 
     rename = {}
     for c in df.columns:
@@ -369,20 +419,26 @@ idx_crit = idx_crit[idx_crit["MÊS"].isin(sel_meses)]
 prod_all, crit_all = [], []
 
 for _, r in idx_prod.iterrows():
-    sid = _sheet_id(r["URL"])
+    sid = _sheet_id(r.get("URL", ""))
     if not sid:
         continue
-    df, _ = read_producao_month(sid)
-    if not df.empty:
-        prod_all.append(df)
+    try:
+        df, _ = read_producao_month(sid)
+        if not df.empty:
+            prod_all.append(df)
+    except Exception as e:
+        st.warning(f"Falha ao ler PRODUÇÃO do sheet {sid}. Ignorando este mês. ({type(e).__name__})")
 
 for _, r in idx_crit.iterrows():
-    sid = _sheet_id(r["URL"])
+    sid = _sheet_id(r.get("URL", ""))
     if not sid:
         continue
-    df, _ = read_critica_month(sid)
-    if not df.empty:
-        crit_all.append(df)
+    try:
+        df, _ = read_critica_month(sid)
+        if not df.empty:
+            crit_all.append(df)
+    except Exception as e:
+        st.warning(f"Falha ao ler CRÍTICA do sheet {sid}. Ignorando este mês. ({type(e).__name__})")
 
 if not prod_all:
     st.error("Não consegui ler dados de PRODUÇÃO de nenhum mês.")
@@ -425,7 +481,6 @@ with col1:
     )
 
 start_d, end_d = drange if isinstance(drange, tuple) and len(drange) == 2 else (min_d, max_d)
-
 mask_dias = s_mes_dates.map(lambda d: isinstance(d, date) and start_d <= d <= end_d)
 viewProd = dfProd_mes[mask_dias].copy()
 
@@ -456,19 +511,42 @@ with col2:
     with c22:
         f_vists = st.multiselect("Vistoriadores (opcional)", vist_opts)
 
+# --- FILTROS POR OS (painel inteiro respeita) ---
+os_keep = None  # vira set() quando algum filtro estiver ativo
+
 if f_analistas:
-    ups = [_upper(a) for a in f_analistas]
-    mask_keep = (viewProd["TIPO_USUARIO"] != "ANALISTA MESA") | (viewProd["USUARIO"].isin(ups))
-    viewProd = viewProd[mask_keep]
-    if not viewCrit.empty and "ANALISTA" in viewCrit.columns:
-        viewCrit = viewCrit[viewCrit["ANALISTA"].isin(ups)]
+    ups_a = [_upper(a) for a in f_analistas]
+    os_a = (
+        viewProd[
+            (viewProd["TIPO_USUARIO"] == "ANALISTA MESA") &
+            (viewProd["USUARIO"].isin(ups_a))
+        ]["OS"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    os_keep = set(os_a)
 
 if f_vists:
-    ups = [_upper(v) for v in f_vists]
-    mask_keep = (viewProd["TIPO_USUARIO"] != "VISTORIADOR") | (viewProd["USUARIO"].isin(ups))
-    viewProd = viewProd[mask_keep]
-    if not viewCrit.empty and "VISTORIADOR" in viewCrit.columns:
-        viewCrit = viewCrit[viewCrit["VISTORIADOR"].isin(ups)]
+    ups_v = [_upper(v) for v in f_vists]
+    os_v = (
+        viewProd[
+            (viewProd["TIPO_USUARIO"] == "VISTORIADOR") &
+            (viewProd["USUARIO"].isin(ups_v))
+        ]["OS"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    os_v = set(os_v)
+    os_keep = (os_keep & os_v) if os_keep is not None else os_v
+
+if os_keep is not None:
+    viewProd = viewProd[viewProd["OS"].astype(str).isin(os_keep)].copy()
+    if not viewCrit.empty and "OS" in viewCrit.columns:
+        viewCrit = viewCrit[viewCrit["OS"].astype(str).isin(os_keep)].copy()
 
 if viewProd.empty:
     st.info("Sem registros de produção da mesa de análise no período/filtros.")
@@ -479,6 +557,7 @@ base_analista = viewProd[viewProd["TIPO_USUARIO"] == "ANALISTA MESA"].copy()
 base_fila = viewProd[viewProd["TIPO_USUARIO"] == "FILA MESA"].copy()
 base_vist = viewProd[viewProd["TIPO_USUARIO"] == "VISTORIADOR"].copy()
 
+total_vistorias_analista = int(base_analista.dropna(subset=["OS"])["OS"].astype(str).nunique())
 total_registros_analista = int(len(base_analista))
 analistas_avaliados = int(base_analista["USUARIO"].nunique()) if not base_analista.empty else 0
 
@@ -492,8 +571,9 @@ tempo_medio_total_proc = tempo_total_por_os.mean() if len(tempo_total_por_os) el
 cards_html = f"""
 <div class="card-wrap">
   <div class='card'>
-    <h4>Registros de análise (Analista Mesa)</h4>
-    <h2>{total_registros_analista:,}</h2>
+    <h4>Vistorias analisadas (OS únicas)</h4>
+    <h2>{total_vistorias_analista:,}</h2>
+    <span class='sub neu'>Linhas (Analista Mesa): {total_registros_analista:,}</span>
   </div>
   <div class='card'>
     <h4>Analistas avaliados</h4>
@@ -528,14 +608,15 @@ c1, c2 = st.columns(2)
 
 if not base_analista.empty:
     with c1:
-        st.markdown('<div class="section">Volume de análises por analista</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section">Volume de análises por analista (OS únicas)</div>', unsafe_allow_html=True)
         vol = (
-            base_analista.groupby("USUARIO", dropna=False)["OS"]
-            .size()
-            .reset_index(name="QTD")
-            .sort_values("QTD", ascending=False)
+            base_analista.dropna(subset=["OS"])
+            .groupby("USUARIO")["OS"]
+            .nunique()
+            .reset_index(name="QTD_OS")
+            .sort_values("QTD_OS", ascending=False)
         )
-        st.altair_chart(bar_with_labels(vol, "USUARIO", "QTD", x_title="ANALISTA"), use_container_width=True)
+        st.altair_chart(bar_with_labels(vol, "USUARIO", "QTD_OS", x_title="ANALISTA", y_title="OS únicas"), use_container_width=True)
 
 if not base_analista.empty:
     with c2:
@@ -561,25 +642,26 @@ if not base_analista.empty:
         labels = base_chart.mark_text(dy=-6).encode(text=alt.Text("TEMPO_MEDIO:N"))
         st.altair_chart((bars + labels).properties(height=340), use_container_width=True)
 
-# ------------------ NOVO: PARTICIPAÇÃO DA PRODUÇÃO POR ANALISTA (META 25% ±3pp) ------------------
+# ------------------ PARTICIPAÇÃO DA PRODUÇÃO POR ANALISTA ------------------
 st.markdown("---")
-st.markdown('<div class="section">Produção por analista em % (meta: 25% ± 3pp)</div>', unsafe_allow_html=True)
+st.markdown('<div class="section">Produção por analista em % (meta: 25% ± 3pp) — por OS únicas</div>', unsafe_allow_html=True)
 
 META_PERC = 25.0
 MARGEM_PP = 3.0
-LIM_INF = META_PERC - MARGEM_PP  # 22
-LIM_SUP = META_PERC + MARGEM_PP  # 28
+LIM_INF = META_PERC - MARGEM_PP
+LIM_SUP = META_PERC + MARGEM_PP
 
 if base_analista.empty:
     st.info("Sem registros de 'ANALISTA MESA' no recorte atual para calcular a participação.")
 else:
     share = (
-        base_analista.groupby("USUARIO", dropna=False)["OS"]
-        .size()
-        .reset_index(name="QTD")
+        base_analista.dropna(subset=["OS"])
+        .groupby("USUARIO")["OS"]
+        .nunique()
+        .reset_index(name="QTD_OS")
     )
-    total_qtd = int(share["QTD"].sum())
-    share["PERC"] = share["QTD"] / total_qtd * 100 if total_qtd else 0.0
+    total_qtd = int(share["QTD_OS"].sum())
+    share["PERC"] = share["QTD_OS"] / total_qtd * 100 if total_qtd else 0.0
     share["DELTA_PP"] = share["PERC"] - META_PERC
 
     def _status_row(p):
@@ -591,7 +673,6 @@ else:
 
     share["STATUS"] = share["PERC"].apply(_status_row)
 
-    # Indicadores (cards por analista)
     share_sorted = share.sort_values("PERC", ascending=False).copy()
     cols = st.columns(min(len(share_sorted), 4))
     for i, (_, r) in enumerate(share_sorted.iterrows()):
@@ -621,16 +702,15 @@ else:
                 unsafe_allow_html=True,
             )
 
-    # Gráfico em % + linhas de meta e limites
     share_plot = share_sorted.copy()
     share_plot["PERC_LABEL"] = share_plot["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
 
     base_s = alt.Chart(share_plot).encode(
         x=alt.X("USUARIO:N", title="Analista", axis=alt.Axis(labelAngle=0, labelLimit=180)),
-        y=alt.Y("PERC:Q", title="% da produção (Analista Mesa)"),
+        y=alt.Y("PERC:Q", title="% da produção (OS únicas)"),
         tooltip=[
             alt.Tooltip("USUARIO:N", title="Analista"),
-            alt.Tooltip("QTD:Q", title="Qtd análises", format=".0f"),
+            alt.Tooltip("QTD_OS:Q", title="OS únicas", format=".0f"),
             alt.Tooltip("PERC:Q", title="%", format=".1f"),
             alt.Tooltip("STATUS:N", title="Status"),
         ],
@@ -639,12 +719,9 @@ else:
     bars_s = base_s.mark_bar(color=CHART_COLOR)
     labels_s = base_s.mark_text(dy=-6).encode(text="PERC_LABEL:N")
 
-    # Linhas (meta e margem)
     df_rules = pd.DataFrame(
-        {
-            "VALOR": [LIM_INF, META_PERC, LIM_SUP],
-            "TIPO": ["Limite inferior (22%)", "Meta (25%)", "Limite superior (28%)"],
-        }
+        {"VALOR": [LIM_INF, META_PERC, LIM_SUP],
+         "TIPO": ["Limite inferior (22%)", "Meta (25%)", "Limite superior (28%)"]}
     )
     rules = alt.Chart(df_rules).mark_rule(strokeDash=[6, 4], color="#666").encode(
         y="VALOR:Q",
@@ -653,12 +730,12 @@ else:
 
     st.altair_chart((bars_s + labels_s + rules).properties(height=320), use_container_width=True)
 
-    # Tabela resumida (opcional, já com status)
-    resumo = share_sorted[["USUARIO", "QTD", "PERC", "STATUS"]].copy()
+    resumo = share_sorted[["USUARIO", "QTD_OS", "PERC", "STATUS"]].copy()
     resumo["PERC"] = resumo["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
+    resumo = resumo.rename(columns={"QTD_OS": "OS únicas"})
     st.dataframe(resumo, use_container_width=True, hide_index=True)
 
-# ------------------ TEMPO TOTAL POR ETAPA (IMPORTANTE) ------------------
+# ------------------ TEMPO TOTAL POR ETAPA ------------------
 st.markdown("---")
 st.markdown('<div class="section">Tempo total por etapa (mesa / fila / vistoriador)</div>', unsafe_allow_html=True)
 
@@ -689,7 +766,6 @@ st.markdown('<div class="section">Índices de qualidade</div>', unsafe_allow_htm
 
 q1, q2, q3 = st.columns(3)
 
-# 1) ÍNDICE DE APONTAMENTOS (CRÍTICA, 1ª análise) — COM FALLBACK (NÃO ZERA)
 with q1:
     st.subheader("Índice de apontamentos (mesa de análise)")
 
@@ -706,8 +782,10 @@ with q1:
         st.info("Sem registros na base de CRÍTICA para o recorte atual.")
     else:
         base_crit = base_crit.dropna(subset=["OS"]).copy()
-        base_crit["STATUS_CRITICA"] = base_crit["STATUS_CRITICA"].astype(str).str.upper().str.strip()
+        if os_keep is not None:
+            base_crit = base_crit[base_crit["OS"].astype(str).isin(os_keep)].copy()
 
+        base_crit["STATUS_CRITICA"] = base_crit["STATUS_CRITICA"].astype(str).str.upper().str.strip()
         if "DATA_CRITICA" in base_crit.columns:
             base_crit = base_crit.sort_values("DATA_CRITICA")
 
@@ -718,24 +796,19 @@ with q1:
         aprov = int(total - reprov)
 
         df_apont = pd.DataFrame(
-            {
-                "CATEGORIA": ["Aprovada de primeira", "Teve apontamento (não aprovada de 1ª)"],
-                "QTD": [aprov, reprov],
-            }
+            {"CATEGORIA": ["Aprovada de primeira", "Teve apontamento (não aprovada de 1ª)"],
+             "QTD": [aprov, reprov]}
         )
         df_apont["PERC"] = (df_apont["QTD"] / total * 100) if total else 0
 
-        st.metric(
-            "Vistorias com apontamento (1ª análise)",
-            (f"{df_apont.loc[1, 'PERC']:.1f}%".replace(".", ",")) if total else "—",
-        )
+        st.metric("Vistorias com apontamento (1ª análise)",
+                  (f"{df_apont.loc[1, 'PERC']:.1f}%".replace(".", ",")) if total else "—")
 
         st.altair_chart(
             bar_with_qty_and_perc(df_apont, "CATEGORIA", "QTD", "PERC", x_title="Situação na 1ª análise"),
             use_container_width=True,
         )
 
-# 2) ÍNDICE DE APROVAÇÃO DO LAUDO (PRODUÇÃO)
 with q2:
     st.subheader("Índice de aprovação do laudo (produção)")
 
@@ -759,7 +832,7 @@ with q2:
                 .reset_index(name="QTD")
                 .sort_values("QTD", ascending=False)
             )
-            status_counts["PERC"] = status_counts["QTD"] / total_os * 100
+            status_counts["PERC"] = status_counts["QTD"] / total_os * 100 if total_os else 0.0
 
             def _cat_status(s: str) -> str:
                 su = _strip_accents(s).upper()
@@ -772,10 +845,10 @@ with q2:
             agg = status_counts.copy()
             agg["CAT"] = agg["STATUS_LAUDO"].apply(_cat_status)
             agg_tot = agg.groupby("CAT")["QTD"].sum().reset_index(name="QTD")
-            agg_tot["PERC"] = agg_tot["QTD"] / total_os * 100
+            agg_tot["PERC"] = agg_tot["QTD"] / total_os * 100 if total_os else 0.0
 
-            perc_aprov = float(agg_tot.loc[agg_tot["CAT"] == "Aprovadas", "PERC"].fillna(0))
-            perc_repr = float(agg_tot.loc[agg_tot["CAT"] == "Reprovadas", "PERC"].fillna(0))
+            perc_aprov = float(agg_tot.loc[agg_tot["CAT"] == "Aprovadas", "PERC"].fillna(0).iloc[0] if (agg_tot["CAT"] == "Aprovadas").any() else 0.0)
+            perc_repr = float(agg_tot.loc[agg_tot["CAT"] == "Reprovadas", "PERC"].fillna(0).iloc[0] if (agg_tot["CAT"] == "Reprovadas").any() else 0.0)
 
             st.markdown(
                 f"<div class='small'><b>{perc_aprov:.1f}%</b> com laudo aprovado (vs <b>{perc_repr:.1f}%</b> reprovadas).</div>".replace(".", ","),
@@ -795,7 +868,6 @@ with q2:
             labels_l = base_l.mark_text(dy=-6).encode(text=alt.Text("PERC:Q", format=".1f"))
             st.altair_chart((bars_l + labels_l).properties(height=320), use_container_width=True)
 
-# 3) 1º EMPLACAMENTO vs TRANSFERÊNCIA
 with q3:
     st.subheader("1º emplacamento vs transferência")
 
@@ -804,12 +876,12 @@ with q3:
 
     tmp_os["TIPO_VISTORIA"] = tmp_os["PLACA"].apply(lambda x: "Transferência" if looks_like_plate(x) else "1º emplacamento")
     dist = tmp_os.groupby("TIPO_VISTORIA")["OS"].nunique().reset_index(name="QTD")
-    total_v = dist["QTD"].sum()
-    dist["PERC"] = dist["QTD"] / total_v * 100 if total_v else 0
+    total_v = int(dist["QTD"].sum())
+    dist["PERC"] = dist["QTD"] / total_v * 100 if total_v else 0.0
 
     base_v = alt.Chart(dist).encode(
         x=alt.X("TIPO_VISTORIA:N", title="Tipo de vistoria", axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("QTD:Q", title="Quantidade"),
+        y=alt.Y("QTD:Q", title="Quantidade (OS únicas)"),
         tooltip=[
             alt.Tooltip("TIPO_VISTORIA:N", title="Tipo"),
             alt.Tooltip("QTD:Q", title="Qtd", format=".0f"),
@@ -904,4 +976,3 @@ if not fast_mode:
         st.dataframe(detc, use_container_width=True, hide_index=True)
 
         st.caption('<div class="table-note">Cada linha representa uma crítica da mesa (aprovada ou reprovada).</div>', unsafe_allow_html=True)
-
